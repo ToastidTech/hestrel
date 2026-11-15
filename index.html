@@ -196,6 +196,29 @@
     border:1px dashed var(--line); border-radius:12px; padding:13px 15px; color:var(--muted); font-size:14.5px;
     background:rgba(51,161,255,.05);
   }
+  .dictation-on{
+    border:1px solid var(--line); border-radius:12px; padding:13px 15px; font-size:14.5px;
+    background:rgba(51,161,255,.05);
+  }
+  .dc-status{font-size:13.5px; color:var(--muted); margin-top:8px}
+  .dc-status.live{color:var(--accent); font-weight:700}
+  .dc-status.err{color:var(--warn); font-weight:600}
+  .dc-live{
+    border:1px dashed var(--line); border-radius:8px; padding:10px 12px; min-height:42px; margin-top:10px;
+    white-space:pre-wrap; background:var(--bg2);
+  }
+  .dc-live .interim{color:var(--muted)}
+  .dc-raw{
+    border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-top:12px;
+    font-size:13.5px; white-space:pre-wrap; background:var(--bg2);
+  }
+  .prop{border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-top:10px; background:var(--panel2)}
+  .prop .plabel{font-weight:700}
+  .prop .pmatch{color:var(--muted); font-size:12.5px; margin-top:2px}
+  .prop .prow{display:flex; gap:10px; flex-wrap:wrap; margin-top:8px}
+  .prop .prow label{display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); flex:1; min-width:110px}
+  .prop .prow label.narrow{flex:0 0 84px; min-width:84px}
+  .prop .prow input{background:var(--bg2); border:1px solid var(--line); border-radius:8px; padding:7px 9px; color:var(--text)}
 
   /* ---------- toast ---------- */
   #toast{
@@ -252,8 +275,9 @@
    Build-order steps 1–3: config-driven estimate core, signature capture
    (consent + approval) with consent page in packet, packet + invoice
    carrying the business's OWN payment link (Toastid is never merchant
-   of record). Step 4 (dictation -> structured line items) hooks are
-   stubbed at the bottom. Disk-first: every change autosaves to
+   of record). Step 4 (dictation -> structured line items) is built at
+   the bottom: Web Speech API capture + transcript structuring.
+   Disk-first: every change autosaves to
    localStorage the moment it happens.
    ===================================================================== */
 
@@ -973,8 +997,7 @@ function renderStepEstimate(job, body) {
     '<div class="btnrow"><button class="btn" id="es-custom" type="button">+ Custom line item</button></div></div>' +
     '<div class="panel"><h3>Line items</h3><div id="es-items"></div><div id="es-totals"></div></div>' +
     '<div class="panel"><h3>Visit notes</h3>' +
-    '<div class="dictation-off">🎙 <strong>Dictation is coming in Step 4.</strong> Soon you\'ll talk the job and Hestrel will structure it into line items using your catalog and the HVAC glossary (' +
-      esc((CATALOG.dictationGlossary || []).slice(0, 6).join(", ")) + '…). For now, type notes below — they save as you go.</div>' +
+    dictationPanelHtml(job) +
     '<label class="field" style="margin-top:12px"><span>Notes for this job</span><textarea class="input" id="es-notes" placeholder="What you found, what you told the customer…">' + esc(job.notes) + "</textarea></label></div>" +
     stepNav(job, 1, 3, "To approval");
   body.querySelectorAll("[data-cat]").forEach(h => h.addEventListener("click", () => {
@@ -995,6 +1018,7 @@ function renderStepEstimate(job, body) {
     renderItems(job, body);
   });
   body.querySelector("#es-notes").addEventListener("input", (e) => { job.notes = e.target.value; persist(job); });
+  wireDictation(job, body);
   renderItems(job, body);
   bindNav(job, body);
 }
@@ -1054,6 +1078,187 @@ function renderItems(job, body) {
     if (s2) s2.textContent = fmtMoney(tt.taxCents);
     if (s3) s3.textContent = fmtMoney(tt.totalCents);
   });
+}
+
+/* ----- Dictation panel (build step 4 UI) -----
+ * The mic exists only when consent is SIGNED — the consent sentence
+ * the customer signed IS the recording agreement. Pending consent:
+ * locked (no signature yet). Declined consent: locked for good on
+ * this job — written-notes mode means NO recording, by design.
+ * Dictated words are never final: they structure into proposals the
+ * tech accepts / edits / dismisses, and only an accept reaches
+ * job.items, through addCatalogItem — the same path as a catalog tap.
+ */
+let dictationUi = null;
+let dictationSession = null;
+
+function dictationStateFor(job) {
+  if (!dictationUi || dictationUi.jobId !== job.id) {
+    dictationUi = { jobId: job.id, status: "idle", finalText: "", interimText: "", proposals: [], rawTranscript: "", notesText: "", error: "" };
+  }
+  return dictationUi;
+}
+function dictationStatusText(st) {
+  if (st.status === "listening") return "● Listening… speak now, then tap Stop & review.";
+  if (st.status === "processing") return "Structuring what you said…";
+  if (st.status === "error") return "⚠ " + (st.error || "Dictation hit a problem — you can type the notes instead.");
+  if (st.status === "done") return "Done — review the proposals below. Nothing counts until you accept it.";
+  return "Ready. Talk through the visit — findings, parts, prices — then review what Hestrel heard.";
+}
+function dictationLiveHtml(st) {
+  const fin = st.finalText ? esc(st.finalText) : "";
+  const inter = st.interimText ? ' <span class="interim">' + esc(st.interimText) + "</span>" : "";
+  if (!fin && !inter) return '<span class="interim">Your words appear here as you speak…</span>';
+  return fin + inter;
+}
+function dictationPanelHtml(job) {
+  const st = dictationStateFor(job);
+  if (job.consent.status === "declined") {
+    return '<div class="dictation-off">🎙 <strong>Dictation is off for this job.</strong> The customer chose written-notes mode — no recording after a declined consent. Type the visit notes below.</div>';
+  }
+  if (job.consent.status !== "signed") {
+    return '<div class="dictation-off">🎙 <strong>Dictation is locked.</strong> No mic opens until the consent is signed on the Consent step — that signature is the recording agreement.</div>';
+  }
+  if (!Dictation.supported) {
+    return '<div class="dictation-off">🎙 <strong>Dictation isn\'t supported in this browser</strong> — type notes below. (Dictation works in Chrome on Android and desktop.)</div>';
+  }
+  const listening = st.status === "listening";
+  return '<div class="dictation-on"><div><strong>🎙 Dictate the visit</strong></div>' +
+    '<p class="tiny" style="margin:4px 0 0">e.g. “Replace the igniter and the capacitor, add a diagnostic fee.” Hestrel matches your catalog + glossary (' +
+    esc((CATALOG.dictationGlossary || []).slice(0, 6).join(", ")) + '…) and proposes line items — you review every one before it counts.</p>' +
+    '<div class="dc-status' + (listening ? " live" : "") + (st.status === "error" ? " err" : "") + '" id="dc-status">' + esc(dictationStatusText(st)) + "</div>" +
+    '<div class="dc-live" id="dc-live">' + dictationLiveHtml(st) + "</div>" +
+    '<div class="btnrow">' +
+    (listening
+      ? '<button class="btn danger" id="dc-stop" type="button">■ Stop &amp; review</button>'
+      : '<button class="btn primary" id="dc-start" type="button">🎙 Start dictation</button>') +
+    (!listening && st.finalText ? '<button class="btn" id="dc-restructure" type="button">Re-read transcript</button><button class="btn ghost" id="dc-clear" type="button">Clear</button>' : "") +
+    "</div>" +
+    '<div id="dc-review">' + dictationReviewHtml(job, st) + "</div></div>";
+}
+function dictationReviewHtml(job, st) {
+  if (!st.rawTranscript) return "";
+  let h = '<div class="dc-raw"><div class="tiny">WHAT HESTREL HEARD (raw — kept so nothing is silently dropped)</div>' + esc(st.rawTranscript) + "</div>";
+  if (st.notesText) {
+    h += '<p class="tiny" style="margin-top:8px">Words that didn\'t match the catalog were added to your visit notes below: “' + esc(st.notesText) + '”</p>';
+  }
+  if (!st.proposals.length) {
+    h += '<p class="subtle" style="margin-top:8px">No catalog items matched — everything went to the visit notes. Add line items from the catalog above.</p>';
+    return h;
+  }
+  h += '<h4 style="margin:12px 0 2px">Proposed line items — your review is the edit pass</h4>';
+  st.proposals.forEach((p, i) => {
+    const eff = (p.priceCents !== null && p.priceCents !== undefined) ? p.priceCents : effectivePriceCents(p.catalogId, priceBook);
+    h += '<div class="prop">' +
+      '<div class="plabel">' + esc(p.label) + "</div>" +
+      '<div class="pmatch">heard: “' + esc(p.matchedText) + '” · per ' + esc(p.unit || "flat") + "</div>" +
+      '<div class="prow">' +
+      '<label>Label<input type="text" data-pf="label" data-pi="' + i + '" value="' + esc(p.label) + '"></label>' +
+      '<label class="narrow">Qty<input type="number" data-pf="qty" data-pi="' + i + '" min="0" step="0.25" inputmode="decimal" value="' + esc(p.qty) + '"></label>' +
+      '<label class="narrow">Price $<input type="number" data-pf="price" data-pi="' + i + '" min="0" step="0.01" inputmode="decimal" placeholder="—" value="' + (eff === null ? "" : String(eff / 100)) + '"></label>' +
+      "</div>" +
+      '<div class="btnrow"><button class="btn small primary" type="button" data-paccept="' + i + '">Accept</button>' +
+      '<button class="btn small ghost" type="button" data-pdismiss="' + i + '">Dismiss</button></div></div>';
+  });
+  return h;
+}
+function finishDictation(job) {
+  const st = dictationStateFor(job);
+  dictationSession = null;
+  const text = (st.finalText || "").trim();
+  if (!text) {
+    st.status = "idle";
+    renderJob(currentStep);
+    toast("Didn't catch anything — try dictation again");
+    return;
+  }
+  const res = Dictation.structureTranscript(text);
+  const sameRound = !!st.rawTranscript && st.rawTranscript === res.raw;
+  if (sameRound) {
+    // Re-read of the same transcript: replace proposals, don't duplicate.
+    st.proposals = res.proposals;
+  } else {
+    st.proposals = st.proposals.concat(res.proposals);
+    st.rawTranscript = st.rawTranscript ? (st.rawTranscript + " " + res.raw) : res.raw;
+    if (res.notesText) {
+      st.notesText = st.notesText ? (st.notesText + " " + res.notesText) : res.notesText;
+      job.notes = job.notes ? (String(job.notes).replace(/\s+$/, "") + "\n" + res.notesText) : res.notesText;
+      persist(job);
+    }
+  }
+  st.status = "done";
+  st.interimText = "";
+  renderJob(currentStep);
+}
+function wireDictation(job, body) {
+  const st = dictationStateFor(job);
+  const startBtn = body.querySelector("#dc-start");
+  const stopBtn = body.querySelector("#dc-stop");
+  const reBtn = body.querySelector("#dc-restructure");
+  const clearBtn = body.querySelector("#dc-clear");
+  if (startBtn) startBtn.addEventListener("click", () => {
+    st.error = "";
+    st.interimText = "";
+    try {
+      dictationSession = Dictation.start(job, {
+        onInterim: (txt) => {
+          st.interimText = txt;
+          const el = document.getElementById("dc-live");
+          if (el) el.innerHTML = dictationLiveHtml(st);
+        },
+        onFinal: (txt) => {
+          st.finalText = txt;
+          st.interimText = "";
+          const el = document.getElementById("dc-live");
+          if (el) el.innerHTML = dictationLiveHtml(st);
+        },
+        onError: (msg) => { st.status = "error"; st.error = msg; renderJob(currentStep); },
+        onEnd: () => { if (st.status === "listening" || st.status === "processing") { st.status = "processing"; finishDictation(job); } }
+      });
+      st.status = "listening";
+      renderJob(currentStep);
+    } catch (e) {
+      st.status = "error";
+      st.error = e.message;
+      renderJob(currentStep);
+    }
+  });
+  if (stopBtn) stopBtn.addEventListener("click", () => {
+    st.status = "processing";
+    if (dictationSession) dictationSession.stop();
+    else finishDictation(job);
+  });
+  if (reBtn) reBtn.addEventListener("click", () => finishDictation(job));
+  if (clearBtn) clearBtn.addEventListener("click", () => {
+    st.finalText = ""; st.interimText = ""; st.proposals = []; st.rawTranscript = ""; st.notesText = ""; st.status = "idle"; st.error = "";
+    renderJob(currentStep);
+  });
+  body.querySelectorAll("[data-paccept]").forEach(btn => btn.addEventListener("click", () => {
+    const i = Number(btn.getAttribute("data-paccept"));
+    const p = st.proposals[i];
+    if (!p) return;
+    const val = (f) => {
+      const inp = body.querySelector('[data-pf="' + f + '"][data-pi="' + i + '"]');
+      return inp ? inp.value : "";
+    };
+    const line = addCatalogItem(job, p.catalogId, priceBook);
+    if (!line) return;
+    const lbl = String(val("label") || "").trim();
+    if (lbl) line.label = lbl;
+    const q = Number(val("qty"));
+    if (isFinite(q) && q > 0) line.qty = q;
+    const pr = val("price");
+    if (pr !== "" && isFinite(Number(pr))) { line.priceCents = Math.round(Number(pr) * 100); line.priceUnset = false; }
+    persist(job);
+    st.proposals.splice(i, 1);
+    renderJob(currentStep);
+    toast("Added: " + line.label);
+  }));
+  body.querySelectorAll("[data-pdismiss]").forEach(btn => btn.addEventListener("click", () => {
+    const i = Number(btn.getAttribute("data-pdismiss"));
+    st.proposals.splice(i, 1);
+    renderJob(currentStep);
+  }));
 }
 
 /* ----- Step 4: estimate approval signature (separate from consent) ---- */
@@ -1387,19 +1592,282 @@ function renderStepInvoice(job, body) {
 }
 
 /* =====================================================================
-   STEP 4 HOOKS — dictation -> structured line items (not built yet).
-   When step 4 lands: MediaRecorder chunks stream OUT (never accumulate
-   whole in memory, per the performance rules), transcription +
-   structuring match against CATALOG + CATALOG.dictationGlossary, and
-   proposed lines land in job.items through addCatalogItem/addCustomItem
-   for tech review — nothing dictated is ever final without an edit pass.
-   The consent gate already guarantees no mic opens before a signature
-   (or the written-notes fallback) exists.
+   STEP 4 — dictation -> structured line items (BUILT).
+   Capture route: the browser Web Speech API (SpeechRecognition /
+   webkitSpeechRecognition) — no backend, no API keys. Results stream
+   in event by event (interim + final), so no audio recording is ever
+   buffered or accumulated in memory; only the running transcript text
+   is kept. That satisfies the original step-4 streaming intent
+   (chunks out, never whole-in-memory) using the platform's own
+   streaming recognizer instead of MediaRecorder.
+   The consent gate is absolute: Dictation.start refuses unless the
+   job's consent is SIGNED — pending means no signature yet, declined
+   means the customer chose written-notes mode (no recording on that
+   job, ever). Dictated words are never final: structureTranscript
+   turns them into PROPOSED line items matched against CATALOG +
+   CATALOG.dictationGlossary, and a proposal reaches job.items only
+   when the tech accepts it in the review, via addCatalogItem.
    ===================================================================== */
+
+/* Normalization is character-aligned with the raw transcript (every
+ * non-word char becomes exactly one space), so match offsets found in
+ * the normalized text index straight back into what the tech said. */
+function dictNorm(raw) {
+  return String(raw || "").toLowerCase().replace(/[^a-z0-9.$]/g, " ");
+}
+function dictTokens(norm) {
+  const out = [];
+  const re = /\S+/g;
+  let m;
+  while ((m = re.exec(norm))) out.push({ text: m[0], start: m.index, end: m.index + m[0].length });
+  return out;
+}
+const DICT_NUMBER_WORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12 };
+const DICT_QTY_FILLER = { the: 1, a: 1, an: 1, new: 1, old: 1, of: 1, x: 1, more: 1, lb: 1, lbs: 1, pound: 1, pounds: 1, foot: 1, feet: 1, ft: 1, hour: 1, hours: 1, vent: 1, vents: 1, head: 1, heads: 1, ton: 1, tons: 1 };
+const DICT_NOTE_FILLER = { and: 1, the: 1, a: 1, an: 1, then: 1, also: 1, please: 1, add: 1, added: 1, replace: 1, replaced: 1, new: 1, put: 1, with: 1, it: 1, its: 1, is: 1, was: 1, to: 1, for: 1, of: 1, on: 1, in: 1, at: 1, more: 1, again: 1, check: 1, checked: 1, needs: 1, needed: 1, fee: 1, look: 1, looked: 1, clean: 1, cleaned: 1 };
+
+/* Match phrases for one catalog item, derived from its label plus any
+ * glossary terms the label contains: the full label, the label minus
+ * trailing action words ("Capacitor replacement" -> "capacitor"),
+ * first+last token ("Diagnostic / service call fee" -> "diagnostic
+ * fee"), and contiguous word pairs. A single-word phrase is trusted
+ * only when it is a glossary term or the whole stripped label, so
+ * fragments like "ac" (from "AC condenser + coil replacement") never
+ * become match keys. */
+function dictItemPhrases(item) {
+  const keys = {};
+  const add = (s) => {
+    const k = String(s || "").toLowerCase().replace(/[^a-z0-9.$]/g, " ").replace(/\s+/g, " ").trim();
+    if (k) keys[k] = true;
+  };
+  const fullLabel = String(item.label || "");
+  const noParen = fullLabel.replace(/\([^)]*\)/g, " ");
+  add(noParen);
+  const ACTION = { replacement: 1, replace: 1, installation: 1, install: 1, cleaning: 1, clean: 1, recharge: 1, inspection: 1 };
+  const toks = noParen.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+  while (toks.length > 1 && ACTION[toks[toks.length - 1]]) toks.pop();
+  if (toks.length) add(toks.join(" "));
+  if (toks.length >= 3) add(toks[0] + " " + toks[toks.length - 1]);
+  for (let i = 0; i + 1 < toks.length; i++) add(toks[i] + " " + toks[i + 1]);
+  const labelNorm = " " + dictNorm(fullLabel).replace(/\s+/g, " ") + " ";
+  const gloss = {};
+  for (const g of (CATALOG.dictationGlossary || [])) {
+    const gn = String(g).toLowerCase().replace(/[^a-z0-9.$]/g, " ").replace(/\s+/g, " ").trim();
+    if (!gn) continue;
+    gloss[gn] = true;
+    if (labelNorm.indexOf(" " + gn + " ") >= 0) add(gn);
+  }
+  const stripped = toks.join(" ");
+  const out = [];
+  for (const k of Object.keys(keys)) {
+    if (k.indexOf(" ") < 0 && !gloss[k] && !(stripped === k && k.length >= 5)) continue;
+    out.push(k);
+  }
+  return out;
+}
+/* Plural tolerance: "capacitor" also matches "capacitors". */
+function dictPhraseVariants(key) {
+  const toks = key.split(" ");
+  const last = toks[toks.length - 1];
+  const vs = {};
+  vs[key] = true;
+  if (last.length > 1 && last.endsWith("s")) { const t = toks.slice(); t[t.length - 1] = last.slice(0, -1); vs[t.join(" ")] = true; }
+  else { const t = toks.slice(); t[t.length - 1] = last + "s"; vs[t.join(" ")] = true; }
+  return Object.keys(vs);
+}
+
+/* Pure structuring: transcript -> { raw, proposals, notesText }.
+ * Proposals are catalog matches (longest phrase wins, catalog order
+ * breaks ties) with best-effort spoken quantity ("two capacitors")
+ * and price ("at 180", "for $95") read from the words around each
+ * match. Everything not consumed by a match becomes notesText, and
+ * the raw transcript rides along so nothing is silently dropped.
+ * This never touches any job — proposals land only via the review. */
+function structureTranscript(transcript) {
+  const raw = String(transcript || "").trim();
+  if (!raw) return { raw: "", proposals: [], notesText: "" };
+  const norm = dictNorm(raw);
+  const hay = " " + norm + " ";
+  const phraseItem = {};
+  const phrases = [];
+  for (const cat of (CATALOG.categories || [])) {
+    for (const item of (cat.items || [])) {
+      for (const key of dictItemPhrases(item)) {
+        for (const v of dictPhraseVariants(key)) {
+          if (!phraseItem[v]) { phraseItem[v] = item.id; phrases.push(v); }
+        }
+      }
+    }
+  }
+  phrases.sort((a, b) => b.length - a.length);
+  const spans = [];
+  const overlaps = (s, e) => spans.some(sp => s < sp.end && e > sp.start);
+  for (const ph of phrases) {
+    const needle = " " + ph + " ";
+    let idx = 0;
+    for (;;) {
+      const at = hay.indexOf(needle, idx);
+      if (at < 0) break;
+      const s = at, e = at + ph.length; // hay is raw shifted by its one leading space
+      if (!overlaps(s, e)) spans.push({ start: s, end: e, itemId: phraseItem[ph] });
+      idx = at + 1;
+    }
+  }
+  spans.sort((a, b) => a.start - b.start);
+  const consumed = spans.map(sp => ({ start: sp.start, end: sp.end }));
+  const byItem = {};
+  const order = [];
+  spans.forEach((sp, i) => {
+    const prevEnd = i > 0 ? spans[i - 1].end : 0;
+    const nextStart = i < spans.length - 1 ? spans[i + 1].start : norm.length;
+    let qty = 1;
+    const beforeToks = dictTokens(norm.slice(prevEnd, sp.start));
+    for (let t = beforeToks.length - 1; t >= 0; t--) {
+      const w = beforeToks[t].text;
+      if (DICT_QTY_FILLER[w]) continue;
+      const n = DICT_NUMBER_WORDS[w] !== undefined ? DICT_NUMBER_WORDS[w] : (/^\d+(\.\d+)?$/.test(w) ? parseFloat(w) : null);
+      if (n !== null) {
+        qty = n;
+        // Consume the number plus the filler/unit words between it and
+        // the match ("three pounds of refrigerant") so they don't leak
+        // into the notes as fragments.
+        for (let j = t; j < beforeToks.length; j++) {
+          consumed.push({ start: prevEnd + beforeToks[j].start, end: prevEnd + beforeToks[j].end });
+        }
+      }
+      break;
+    }
+    let priceCents = null;
+    const after = norm.slice(sp.end, Math.min(nextStart, sp.end + 80));
+    const pm = after.match(/(?:at|@|for)\s*\$?\s*(\d[\d,]*(?:\.\d{1,2})?)|\$\s*(\d[\d,]*(?:\.\d{1,2})?)|(\d[\d,]*(?:\.\d{1,2})?)\s*(?:dollars|bucks)/);
+    if (pm) {
+      const v = pm[1] || pm[2] || pm[3];
+      priceCents = Math.round(parseFloat(String(v).replace(/,/g, "")) * 100);
+      consumed.push({ start: sp.end + pm.index, end: sp.end + pm.index + pm[0].length });
+    } else {
+      const before = norm.slice(prevEnd, sp.start);
+      const bm = before.match(/\$\s*(\d[\d,]*(?:\.\d{1,2})?)/);
+      if (bm) {
+        priceCents = Math.round(parseFloat(String(bm[1]).replace(/,/g, "")) * 100);
+        consumed.push({ start: prevEnd + bm.index, end: prevEnd + bm.index + bm[0].length });
+      }
+    }
+    const item = catalogItemById(sp.itemId);
+    const matchedText = raw.slice(sp.start, sp.end);
+    if (byItem[sp.itemId]) {
+      byItem[sp.itemId].qty += qty;
+      if (byItem[sp.itemId].priceCents === null) byItem[sp.itemId].priceCents = priceCents;
+      byItem[sp.itemId].matchedText += " + " + matchedText;
+    } else {
+      byItem[sp.itemId] = { catalogId: sp.itemId, label: item ? item.label : sp.itemId, unit: item ? (item.unit || "flat") : "flat", qty: qty, priceCents: priceCents, matchedText: matchedText };
+      order.push(sp.itemId);
+    }
+  });
+  consumed.sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const c of consumed) {
+    const last = merged[merged.length - 1];
+    if (last && c.start <= last.end) last.end = Math.max(last.end, c.end);
+    else merged.push({ start: c.start, end: c.end });
+  }
+  const frags = [];
+  let pos = 0;
+  for (const c of merged) { if (c.start > pos) frags.push(raw.slice(pos, c.start)); pos = Math.max(pos, c.end); }
+  if (pos < raw.length) frags.push(raw.slice(pos));
+  const kept = [];
+  for (const f of frags) {
+    const wordOf = (t) => t.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const isFiller = (t) => { const w = wordOf(t); return w === "" || !!DICT_NOTE_FILLER[w]; };
+    const toks = f.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+    while (toks.length && isFiller(toks[0])) toks.shift();
+    while (toks.length && isFiller(toks[toks.length - 1])) toks.pop();
+    if (!toks.length) continue;
+    if (toks.every(isFiller)) continue;
+    const clean = toks.join(" ").replace(/^[\s,.;:]+/, "").replace(/[\s,.;:]+$/, "").trim();
+    if (clean) kept.push(clean);
+  }
+  let notesText = kept.join("; ");
+  if (notesText) notesText = notesText.charAt(0).toUpperCase() + notesText.slice(1);
+  return { raw: raw, proposals: order.map(id => byItem[id]), notesText: notesText };
+}
+
+function dictationCtor() {
+  if (typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition)) {
+    return window.SpeechRecognition || window.webkitSpeechRecognition;
+  }
+  if (typeof globalThis !== "undefined" && (globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition)) {
+    return globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition;
+  }
+  return null;
+}
+function dictationErrorText(code) {
+  if (code === "not-allowed" || code === "service-not-allowed") return "Microphone permission was denied — allow mic access for this site, or type the notes instead.";
+  if (code === "no-speech") return "No speech was heard — try again, closer to the mic.";
+  if (code === "audio-capture") return "No microphone was found on this device.";
+  if (code === "network") return "The speech service needs a connection — check the signal, or type the notes instead.";
+  return "Dictation stopped (" + (code || "unknown error") + ") — type the notes instead if it keeps happening.";
+}
+
 const Dictation = {
-  supported: false,
   glossary: (typeof CATALOG !== "undefined" && CATALOG.dictationGlossary) || [],
-  start: function (job) { throw new Error("Dictation arrives in build step 4."); }
+  /* Real capability check, evaluated live: true only where the Web
+   * Speech API exists (Chrome today; Safari/Firefox fall back to the
+   * typed-notes panel). */
+  get supported() { return !!dictationCtor(); },
+  canDictate(job) { return !!(job && job.consent && job.consent.status === "signed"); },
+  lockReason(job) {
+    if (!job || !job.consent || job.consent.status === "pending") {
+      return "Dictation is locked until the consent is signed — no mic opens before that signature exists.";
+    }
+    if (job.consent.status === "declined") {
+      return "The customer chose written-notes mode for this job — dictation stays off (no recording after a declined consent).";
+    }
+    return "";
+  },
+  structureTranscript: structureTranscript,
+  /* One recognition session. Handlers: onInterim(text), onFinal(fullText),
+   * onError(message), onEnd(). Only transcript text is retained — the
+   * recognizer streams results and discards audio itself. */
+  createSession(handlers) {
+    const Ctor = dictationCtor();
+    if (!Ctor) return null;
+    handlers = handlers || {};
+    const rec = new Ctor();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = "en-US";
+    let finalText = "";
+    let active = false;
+    rec.onresult = function (ev) {
+      let interim = "";
+      for (let i = ev.resultIndex || 0; i < ev.results.length; i++) {
+        const r = ev.results[i];
+        const txt = (r && r[0] && r[0].transcript) || "";
+        if (r.isFinal) {
+          finalText = (finalText + " " + txt).replace(/\s+/g, " ").trim();
+          if (handlers.onFinal) handlers.onFinal(finalText);
+        } else {
+          interim += txt;
+        }
+      }
+      if (handlers.onInterim) handlers.onInterim(interim);
+    };
+    rec.onerror = function (ev) { if (handlers.onError) handlers.onError(dictationErrorText(ev && ev.error)); };
+    rec.onend = function () { active = false; if (handlers.onEnd) handlers.onEnd(); };
+    return {
+      start() { if (active) return; active = true; try { rec.start(); } catch (e) { active = false; throw e; } },
+      stop() { try { rec.stop(); } catch (e) { /* already stopped */ } },
+      get active() { return active; },
+      get finalText() { return finalText; }
+    };
+  },
+  start(job, handlers) {
+    if (!Dictation.canDictate(job)) throw new Error(Dictation.lockReason(job));
+    const session = Dictation.createSession(handlers);
+    if (!session) throw new Error("Dictation isn't supported in this browser.");
+    session.start();
+    return session;
+  }
 };
 // Exposed for step 4 and for headless verification of the core flow.
 window.Hestrel = {

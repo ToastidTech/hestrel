@@ -9,6 +9,6 @@ Hestrel is a field-estimate PWA for home-services businesses (HVAC first). A tec
 - Config-driven content packs per trade (HVAC pack included, prices set by the business at setup)
 - Two distinct signatures: consent to the on-site conversation, then approval of the work
 
-Status: v1 core (estimate core, consent + approval, packet, invoice). Dictation capture and cloud consent storage are on the roadmap.
+Status: v1 core (estimate core, consent + approval, packet, invoice) plus Step 4 dictation — consent-gated Web Speech API capture that structures speech into proposed line items for tech review. Cloud consent storage is on the roadmap.
 
 A Toastid Tech, LLC product.
