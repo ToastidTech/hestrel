@@ -229,11 +229,34 @@
   }
   #toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
 
+  /* ---------- welcome gate (launch lockdown) ---------- */
+  #welcome-gate{
+    position:fixed; inset:0; z-index:9999; background:var(--bg);
+    display:flex; align-items:center; justify-content:center; padding:20px;
+  }
+  #welcome-gate.hidden{display:none}
+  .gate-card{
+    width:100%; max-width:400px; background:var(--panel); border:1px solid var(--line);
+    border-radius:18px; padding:34px 28px 28px; text-align:center;
+    box-shadow:0 24px 60px rgba(0,0,0,.5);
+  }
+  .gate-card img{width:84px; height:84px; border-radius:20px}
+  .gate-name{font-size:34px; font-weight:800; letter-spacing:2px; margin-top:14px}
+  .gate-name span{color:var(--accent)}
+  .gate-tag{color:var(--accent2); font-size:14px; margin-top:4px}
+  .gate-msg{opacity:.85; font-size:14px; line-height:1.5; margin:18px 0 4px}
+  .gate-card .input{text-align:center; font-size:17px; letter-spacing:2px; margin-top:14px; text-transform:uppercase}
+  .gate-btn{width:100%; margin-top:12px; padding:13px; font-size:16px}
+  .gate-err{color:#ff7a7a; font-size:13px; min-height:18px; margin-top:10px}
+  .gate-call{margin-top:14px; font-size:13px; opacity:.8; line-height:1.5}
+  .gate-shake{animation:gateshake .3s ease 2}
+  @keyframes gateshake{25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
+
   /* ---------- printable document (packet / invoice) ---------- */
   #print-area{display:none}
   @media print{
     body{background:#fff}
-    .topbar, main, #toast, .banner{display:none !important}
+    .topbar, main, #toast, .banner, #welcome-gate{display:none !important}
     #print-area{display:block !important}
     .doc{padding:6px 4px}
     @page{margin:14mm}
@@ -241,6 +264,19 @@
 </style>
 </head>
 <body>
+
+<div id="welcome-gate" role="dialog" aria-label="Welcome to Hestrel">
+  <div class="gate-card" id="gate-card">
+    <img id="gate-logo" alt="Hestrel logo">
+    <div class="gate-name">HEST<span>REL</span></div>
+    <div class="gate-tag">Every Estimate Has a Witness.</div>
+    <p class="gate-msg">Hestrel is opening to licensed pros first during launch week. Enter your access code to come in.</p>
+    <input class="input" id="gate-code" type="text" placeholder="ACCESS CODE" autocomplete="off" autocapitalize="characters" spellcheck="false">
+    <button class="btn primary gate-btn" id="gate-enter" type="button">Enter Hestrel</button>
+    <div class="gate-err" id="gate-err"></div>
+    <p class="gate-call">No code yet? Call Ravuna at <a href="tel:+14793391504">(479) 339-1504</a> and she'll get you set up.</p>
+  </div>
+</div>
 
 <header class="topbar">
   <div class="brand">
@@ -1883,6 +1919,39 @@ window.Hestrel = {
 if (storageFault) onStorageError(storageFault);
 renderJobs();
 showView("jobs");
+</script>
+<script>
+/* Welcome gate — launch lockdown (added Nov 15, 2026, Sean's order).
+   Client-side gate: keeps casual visitors out of the app during launch
+   week. Real account enforcement arrives with customer accounts.
+   To change the code, edit GATE_CODE below and redeploy. */
+(function(){
+  var GATE_CODE = "WITNESS";
+  var KEY = "hestrel.gate.v1";
+  var gate = document.getElementById("welcome-gate");
+  if(!gate) return;
+  try{ if(sessionStorage.getItem(KEY)==="ok"){ gate.classList.add("hidden"); return; } }catch(e){}
+  var logo = document.querySelector(".brand img");
+  var gl = document.getElementById("gate-logo");
+  if(logo && gl) gl.src = logo.src;
+  var input = document.getElementById("gate-code");
+  var err = document.getElementById("gate-err");
+  var card = document.getElementById("gate-card");
+  function tryEnter(){
+    var v = (input.value||"").trim().toUpperCase();
+    if(v === GATE_CODE){
+      try{ sessionStorage.setItem(KEY,"ok"); }catch(e){}
+      gate.classList.add("hidden");
+    } else {
+      err.textContent = "That code doesn't match. Check it and try again.";
+      card.classList.remove("gate-shake"); void card.offsetWidth; card.classList.add("gate-shake");
+      input.select();
+    }
+  }
+  document.getElementById("gate-enter").addEventListener("click", tryEnter);
+  input.addEventListener("keydown", function(ev){ if(ev.key==="Enter") tryEnter(); });
+  setTimeout(function(){ try{ input.focus(); }catch(e){} }, 60);
+})();
 </script>
 </body>
 </html>
